@@ -5,7 +5,7 @@ with open("README.md", "r") as f:
 
 setuptools.setup(
     name="seg2stream",
-    version="0.0.1",
+    version="1.0.0",
     author="Daking Liou",
     author_email="lioudaking@foxmail.com",
     description="Real-time pipeline for segmenting text into a sentence stream.",
