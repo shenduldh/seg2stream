@@ -5,7 +5,7 @@ with open("README.md", "r") as f:
 
 setuptools.setup(
     name="seg2stream",
-    version="1.0.0",
+    version="1.0.2",
     author="Daking Liou",
     author_email="lioudaking@foxmail.com",
     description="Real-time pipeline for segmenting text into a sentence stream.",
@@ -19,6 +19,7 @@ setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.10",
-    install_requires=["stanza==1.10.1"],
+    install_requires=[],
+    extras_require={"optional": ["stanza==1.10.1"]},
     keywords="sentence segmentation, tts",
 )
