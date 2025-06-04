@@ -3,7 +3,7 @@ import asyncio
 from asyncio import Queue
 import time
 import re
-from typing import List, Callable
+from typing import List, Callable, Union
 
 
 @dataclass
@@ -27,7 +27,6 @@ class SegmentationConfig:
     # first_chunk_transfer_time: float
 
 
-@dataclass
 class SegmentationPipeline:
     """### 动态调整累积时间 \n
     - 假设：生成首块后，后续播放连续 \n
@@ -37,32 +36,40 @@ class SegmentationPipeline:
     - 分割策略：累积时间 ==> 开始计算超时时间 ==> 循环 (最多句子检测 -> 最多短语检测 -> 最多韵律检测) 直至超时 ==> 返回剩余缓存
     """
 
-    config: SegmentationConfig  # 固定配置
-    segmenters: List[Callable[[str], str]]  # 分割方法
+    def __init__(
+        self, config: SegmentationConfig, segmenters: List[Callable[[str], str]]
+    ):
+        self.config = config  # 固定配置
+        self.segmenters = segmenters
+        self.reset_status()
 
-    in_queue: Queue = field(default_factory=Queue)  # 接收外部输入的文本流
-    out_queue: Queue = field(default_factory=Queue)  # 输出分割结果到外部
-    source: List[str] = field(default_factory=list)  # 存储原始输入的文本流
-    segmenteds: List[str] = field(default_factory=list)  # 存储分割结果
-    last_combined: str = ""  # 临时保存未满足条件的分割结果
-    buffer: str = ""  # 缓存输入的文本流
-    is_last_segmented: bool = False  # 用于判断最近是否存在分割
+    def reset_status(self):
+        self.in_queue: Queue = Queue()  # 接收外部输入的文本流
+        self.out_queue: Queue = Queue()  # 输出分割结果到外部
+        self.source: List[str] = []  # 存储原始输入的文本流
+        self.segmenteds: List[str] = []  # 存储分割结果
+        self.last_combined: str = ""  # 临时保存未满足条件的分割结果
+        self.buffer: str = ""  # 缓存输入的文本流
+        self.is_last_segmented: bool = False  # 用于判断最近是否存在分割
 
-    # 用于触发分割条件
-    is_accumulating: bool = True  # 是否正在进行累积
-    accu_start_time: float | None = None  # 累积开始时间
-    max_buffer_size: int = 0  # 当前最大缓存大小
-    max_accu_time: float = 0.0  # 当前最大累积时间
+        # 用于触发分割条件
+        self.is_accumulating: bool = True  # 是否正在进行累积
+        self.accu_start_time: Union[float | None] = None  # 累积开始时间
+        self.max_buffer_size: int = 0  # 当前最大缓存大小
+        self.max_accu_time: float = 0.0  # 当前最大累积时间
 
-    # 用于计算分割时长和超时时间
-    seg_start_time: float | None = None  # 分割开始时间
-    all_seg_time: List[float] = field(default_factory=list)  # 保存最近的分割完成时间
+        # 用于计算分割时长和超时时间
+        self.seg_start_time: Union[float | None] = None  # 分割开始时间
+        self.all_seg_time: List[float] = []  # 保存最近的分割完成时间
 
-    # 用于限制分割结果
-    min_seg_size: int = 0  # 当前最小分割大小
-    num_consec_splits: int = 0  # 连续未分割成功的次数
+        # 用于限制分割结果
+        self.min_seg_size: int = 0  # 当前最小分割大小
+        self.num_consec_splits: int = 0  # 连续未分割成功的次数
 
-    def fill(self, text: str | None):
+    def get_segmenteds(self):
+        return self.segmenteds
+
+    def fill(self, text: Union[str | None]):
         self.in_queue.put_nowait(text)
 
     def fire(self, uncombined_segmenteds: list[str], forced=False, end=False):
@@ -93,7 +100,7 @@ class SegmentationPipeline:
         start_time = time.time()
         while True:
             try:
-                segmented: str | None = self.out_queue.get_nowait()
+                segmented: Union[str | None] = self.out_queue.get_nowait()
                 if segmented is None:
                     return
                 start_time = time.time()

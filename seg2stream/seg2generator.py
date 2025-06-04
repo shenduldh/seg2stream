@@ -3,7 +3,7 @@ import asyncio
 from asyncio import Queue
 import time
 import re
-from typing import List, Callable
+from typing import List, Callable, Union
 
 
 @dataclass
@@ -16,23 +16,29 @@ class SegmentationConfig:
     min_seg_size: int
 
 
-@dataclass
 class SegmentationPipeline:
-    config: SegmentationConfig  # 固定配置
-    segmenters: List[Callable[[str], str]]  # 分割方法
+    def __init__(
+        self, config: SegmentationConfig, segmenters: List[Callable[[str], str]]
+    ):
+        self.config = config  # 固定配置
+        self.segmenters = segmenters
+        self.reset_status()
 
-    in_queue: Queue = field(default_factory=Queue)  # 接收外部输入的文本流
-    out_queue: Queue = field(default_factory=Queue)  # 输出异步生成器到外部
-    mid_queue: Queue = field(default_factory=Queue)  # 传递文本到异步生成器
-    source: List[str] = field(default_factory=list)  # 存储原始输入的文本流
-    segmenteds: List[str] = field(default_factory=list)  # 存储分割结果
-    buffer: str = ""  # 缓存文本流
+    def reset_status(self):
+        self.in_queue: Queue = Queue()  # 接收外部输入的文本流
+        self.out_queue: Queue = Queue()  # 输出分割结果到外部
+        self.mid_queue: Queue = Queue()  # 传递文本到异步生成器
+        self.source: List[str] = []  # 存储原始输入的文本流
+        self.segmenteds: List[str] = []  # 存储分割结果
+        self.buffer: str = ""  # 缓存输入的文本流
+        self.is_detecting: bool = False  # 是否在检测
+        self.detect_start_time: Union[float | None] = None  # 检测开始时间
+        self.min_seg_size: int = 0  # 当前最小分割大小
 
-    is_detecting: bool = False  # 是否在检测
-    detect_start_time: float | None = None  # 检测开始时间
-    min_seg_size: int = 0  # 当前最小分割大小
+    def get_segmenteds(self):
+        return self.segmenteds
 
-    def fill(self, text: str | None):
+    def fill(self, text: Union[str | None]):
         self.in_queue.put_nowait(text)
 
     def fire(self, finished=False):
