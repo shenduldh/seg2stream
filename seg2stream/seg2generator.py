@@ -3,11 +3,13 @@ import asyncio
 from asyncio import Queue
 import time
 import re
-from typing import List
+from typing import List, Callable
 
 
 @dataclass
 class SegmentationConfig:
+    segmentation_suffix: str
+    ##############
     max_waiting_time: float  # 等待超时时间
     max_stream_time: float  # 流式超时时间
     first_min_seg_size: int
@@ -15,8 +17,9 @@ class SegmentationConfig:
 
 
 @dataclass
-class SegmentationStatus:
+class SegmentationPipeline:
     config: SegmentationConfig  # 固定配置
+    segmenters: List[Callable[[str], str]]  # 分割方法
 
     in_queue: Queue = field(default_factory=Queue)  # 接收外部输入的文本流
     out_queue: Queue = field(default_factory=Queue)  # 输出异步生成器到外部
@@ -45,7 +48,7 @@ class SegmentationStatus:
         else:
             self.out_queue.put_nowait(None)
 
-    async def async_output_stream(self, interval=0.001):
+    async def output_stream(self, interval=0.001):
         start_time = time.time()
         while True:
             try:
@@ -80,7 +83,21 @@ class SegmentationStatus:
                     self.mid_queue.put_nowait(char)
                     can_detection, is_waiting_timeout = self.check_conditions()
                     yield can_detection, is_waiting_timeout
-                    # self.postprocessing()
+                    self.postprocessing()
+
+    def detect_breakpoint(self):
+        target_text = self.buffer + self.config.segmentation_suffix
+        for segmenter in self.segmenters:
+            tail = segmenter(target_text)[-1]
+            if tail == self.config.segmentation_suffix:
+                return True
+        return False
+
+    async def segment(self):
+        async for can_detection, is_waiting_timeout in self.step():
+            if can_detection and (is_waiting_timeout or self.detect_breakpoint()):
+                self.fire()
+        self.fire(True)
 
     def on_start(self):
         self.fire()
@@ -105,47 +122,3 @@ class SegmentationStatus:
 
     def postprocessing(self):
         pass
-
-
-class SentenceSegmentationPipeline:
-    def __init__(
-        self,
-        sentence_segmenter=None,
-        phrase_segmenter=None,
-        segment_aux_suffix="####",
-        **kwargs,
-    ):
-        self.config = SegmentationConfig(**kwargs)
-        self.status = SegmentationStatus(config=self.config)
-
-        assert any([sentence_segmenter is not None, phrase_segmenter is not None])
-        self.sentence_segmenter = sentence_segmenter
-        self.phrase_segmenter = phrase_segmenter
-        self.segment_aux_suffix = segment_aux_suffix
-
-    def reset_status(self):
-        self.status = SegmentationStatus(config=self.config)
-
-    def __detect_breakpoint__(self):
-        target_text = self.status.buffer + self.segment_aux_suffix
-        if self.sentence_segmenter is not None:  # 句子检测
-            tail = self.sentence_segmenter(target_text)[-1]
-        if self.phrase_segmenter is not None:  # 短语检测
-            tail = self.phrase_segmenter(target_text)[-1]
-        return tail == self.segment_aux_suffix
-
-    async def segment(self):
-        async for can_detection, is_waiting_timeout in self.status.step():
-            if can_detection and (is_waiting_timeout or self.__detect_breakpoint__()):
-                self.status.fire()
-        self.status.fire(True)
-
-    def add_text(self, text: str | None):
-        """Input `None` to indicate the end."""
-        self.status.fill(text)
-
-    def get_out_stream(self, interval: float = 0.001):
-        return self.status.async_output_stream(interval)
-
-    def get_segmenteds(self):
-        return self.status.segmenteds

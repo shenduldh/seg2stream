@@ -3,11 +3,13 @@ import asyncio
 from asyncio import Queue
 import time
 import re
-from typing import List
+from typing import List, Callable
 
 
 @dataclass
 class SegmentationConfig:
+    segmentation_suffix: str
+    ##############
     first_max_accu_time: float
     max_accu_time: float
     first_max_buffer_size: int
@@ -26,8 +28,17 @@ class SegmentationConfig:
 
 
 @dataclass
-class SegmentationStatus:
+class SegmentationPipeline:
+    """### 动态调整累积时间 \n
+    - 假设：生成首块后，后续播放连续 \n
+    - 预留时间 = 分割成功时间 (固定为上一次分割成功时间 * 2) + 合成首块时间 (动态计算) + 传输首块时间 (目前固定) + 淡入淡出时间 (固定) \n
+    - 累积时间 = 下一次分割开始 - 当前分割完成 \n
+    - 总时间 = 累积时间 + 预留时间 = 合成首块时间 (动态计算) + 传输首块时间 (目前固定) + 完整语音时长 (动态计算) \n
+    - 分割策略：累积时间 ==> 开始计算超时时间 ==> 循环 (最多句子检测 -> 最多短语检测 -> 最多韵律检测) 直至超时 ==> 返回剩余缓存
+    """
+
     config: SegmentationConfig  # 固定配置
+    segmenters: List[Callable[[str], str]]  # 分割方法
 
     in_queue: Queue = field(default_factory=Queue)  # 接收外部输入的文本流
     out_queue: Queue = field(default_factory=Queue)  # 输出分割结果到外部
@@ -78,25 +89,11 @@ class SegmentationStatus:
         if end:
             self.out_queue.put_nowait(None)
 
-    def output_stream(self, interval=0.001):
+    async def output_stream(self, interval=0.001):
         start_time = time.time()
         while True:
             try:
-                segmented = self.out_queue.get_nowait()
-                if segmented is None:
-                    return
-                start_time = time.time()
-                yield segmented
-            except asyncio.QueueEmpty:
-                if (time.time() - start_time) > self.config.max_stream_time:
-                    return
-                time.sleep(interval)
-
-    async def async_output_stream(self, interval=0.001):
-        start_time = time.time()
-        while True:
-            try:
-                segmented = self.out_queue.get_nowait()
+                segmented: str | None = self.out_queue.get_nowait()
                 if segmented is None:
                     return
                 start_time = time.time()
@@ -121,6 +118,23 @@ class SegmentationStatus:
                     yield can_segment, is_waiting_timeout
                     self.postprocessing()
 
+    def segment_once(self):
+        for segmenter in self.segmenters:
+            target_text = self.buffer + self.config.segmentation_suffix
+            segmenteds = segmenter(target_text)[:-1]
+            self.fire(segmenteds)
+
+    async def segment(self):
+        async for can_segment, is_waiting_timeout in self.step():
+            if can_segment:
+                self.segment_once()
+                if is_waiting_timeout:
+                    self.fire([self.buffer], forced=True)
+
+        if len(self.buffer) > 0:
+            self.segment_once()
+        self.fire([self.buffer], forced=True, end=True)
+
     def on_start(self):
         self.max_accu_time = self.config.first_max_accu_time
         self.max_buffer_size = self.config.first_max_buffer_size
@@ -136,14 +150,14 @@ class SegmentationStatus:
         if self.is_accumulating:
             # 在累积时，判断是否可以进行分割
             # 是否达到累积时间或累积大小
-            can_detection = (
+            can_segment = (
                 time.time() - self.accu_start_time
-            ) >= self.max_accu_time and len(self.buffer) > self.max_buffer_size
-            if can_detection:
+            ) >= self.max_accu_time or len(self.buffer) > self.max_buffer_size
+            if can_segment:
                 self.is_accumulating = False
                 self.seg_start_time = time.time()
                 self.num_consec_splits += 1
-            return can_detection, False
+            return can_segment, False
         else:
             # 调整连续未分割成功的次数
             if self.num_consec_splits > self.config.loose_steps:
@@ -179,64 +193,3 @@ class SegmentationStatus:
             self.num_consec_splits = 0
             self.is_accumulating = True
             self.accu_start_time = time.time()
-
-
-class SentenceSegmentationPipeline:
-    """### 动态调整累积时间 \n
-    - 假设：生成首块后，后续播放连续 \n
-    - 预留时间 = 分割成功时间 (固定为上一次分割成功时间 * 2) + 合成首块时间 (动态计算) + 传输首块时间 (目前固定) + 淡入淡出时间 (固定) \n
-    - 累积时间 = 下一次分割开始 - 当前分割完成 \n
-    - 总时间 = 累积时间 + 预留时间 = 合成首块时间 (动态计算) + 传输首块时间 (目前固定) + 完整语音时长 (动态计算) \n
-    - 分割策略：累积时间 ==> 开始计算超时时间 ==> 循环 (最多句子检测 -> 最多短语检测 -> 最多韵律检测) 直至超时 ==> 返回剩余缓存
-    """
-
-    def __init__(
-        self,
-        sentence_segmenter=None,
-        phrase_segmenter=None,
-        segment_aux_suffix="####",
-        **kwargs,
-    ):
-        self.config = SegmentationConfig(**kwargs)
-        self.reset_status()
-
-        assert any([sentence_segmenter is not None, phrase_segmenter is not None])
-        self.sentence_segmenter = sentence_segmenter
-        self.phrase_segmenter = phrase_segmenter
-        self.segment_aux_suffix = segment_aux_suffix
-
-    def reset_status(self):
-        self.status = SegmentationStatus(config=self.config)
-
-    def __segment_once__(self):
-        if self.sentence_segmenter is not None:  # 句子检测
-            target_text = self.status.buffer + self.segment_aux_suffix
-            segmenteds = self.sentence_segmenter(target_text)[:-1]
-            self.status.fire(segmenteds)
-        if self.phrase_segmenter is not None:  # 短语检测
-            target_text = self.status.buffer + self.segment_aux_suffix
-            segmenteds = self.phrase_segmenter(target_text)[:-1]
-            self.status.fire(segmenteds)
-
-    async def segment(self):
-        async for can_detection, is_waiting_timeout in self.status.step():
-            if can_detection:
-                self.__segment_once__()
-                if is_waiting_timeout:
-                    self.status.fire([self.status.buffer], forced=True)
-
-        if len(self.status.buffer) > 0:
-            self.__segment_once__()
-        self.status.fire([self.status.buffer], forced=True, end=True)
-
-    def add_text(self, text: str | None):
-        """Input `None` to indicate the end."""
-        self.status.fill(text)
-
-    def get_out_stream(self, interval: float = 0.001, is_async: bool = True):
-        if is_async:
-            return self.status.async_output_stream(interval)
-        return self.status.output_stream(interval)
-
-    def get_segmenteds(self):
-        return self.status.segmenteds
