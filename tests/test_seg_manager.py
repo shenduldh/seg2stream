@@ -22,7 +22,6 @@ seg_manager = SegmentationManager(
         seconds_per_word=0.3,
     ),
     on_output=lambda id, text: print(id, text),
-    output_type="string",
 )
 
 

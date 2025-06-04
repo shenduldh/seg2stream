@@ -31,6 +31,7 @@ class SegmentationStatus:
         async def process_output():
             async for output in self.pipeline.output_stream():
                 self.out.put((self.id, output))
+            self.out.put((self.id, None))
 
         self.add_future(process_output())
         self.add_future(self.pipeline.segment())
@@ -49,16 +50,14 @@ class SegmentationManager:
         self,
         seg_config: SegSent2StreamConfig | SegSent2GeneratorConfig,
         on_output: Callable[[str, str], Any],
-        output_type: Literal["generator", "string"] = "string",
         segmenters: List[Callable[[str], str]] | None = None,
     ):
         self.seg_config = seg_config
 
-        match output_type:
-            case "generator":
-                self.seg_pipeline_class = SegSent2GeneratorPipeline
-            case "string":
-                self.seg_pipeline_class = SegSent2StreamPipeline
+        if isinstance(seg_config, SegSent2StreamConfig):
+            self.seg_pipeline_class = SegSent2StreamPipeline
+        elif isinstance(seg_config, SegSent2GeneratorConfig):
+            self.seg_pipeline_class = SegSent2GeneratorPipeline
 
         if segmenters is None:
             self.segmenters = [get_sentence_segmenter()]

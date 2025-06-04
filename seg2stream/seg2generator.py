@@ -3,7 +3,7 @@ import asyncio
 from asyncio import Queue
 import time
 import re
-from typing import List, Callable, Union
+from typing import List, Callable, Union, AsyncGenerator
 
 
 @dataclass
@@ -58,7 +58,9 @@ class SegmentationPipeline:
         start_time = time.time()
         while True:
             try:
-                generator = self.out_queue.get_nowait()
+                generator: Union[AsyncGenerator[str, None] | None] = (
+                    self.out_queue.get_nowait()
+                )
                 if generator is None:
                     return
                 start_time = time.time()
