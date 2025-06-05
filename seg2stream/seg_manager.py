@@ -102,7 +102,7 @@ class SegmentationManager:
         while True:
             id, output = self.out_queue.get()
             if id is None:
-                break
+                return
             yield (id, output)
 
     def close(self):
