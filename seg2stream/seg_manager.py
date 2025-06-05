@@ -1,9 +1,8 @@
-from dataclasses import dataclass, field
-import asyncio
-from typing import List, Callable, Dict, Coroutine, Any, Literal
-from multiprocessing import Manager, Process
 import queue
-import threading
+import asyncio
+from dataclasses import dataclass
+from typing import List, Callable, Dict
+from multiprocessing import Manager, Process
 
 from .seg2stream import (
     SegmentationPipeline as SegSent2StreamPipeline,
@@ -17,39 +16,29 @@ from .segmenters import get_sentence_segmenter
 
 
 @dataclass
-class SegmentationStatus:
-    id: str
-    pipeline: SegSent2StreamPipeline | SegSent2GeneratorPipeline
-    out: queue.Queue
-    loop: asyncio.AbstractEventLoop
-    futures: List[asyncio.Future] = field(default_factory=list)
-
-    def add_text(self, text: str | None):
-        self.pipeline.fill(text)
-
-    def run(self):
+class SegmentationTask:
+    def __init__(
+        self,
+        id: str,
+        pipeline: SegSent2StreamPipeline | SegSent2GeneratorPipeline,
+        out_queue: queue.Queue,
+    ):
         async def process_output():
-            async for output in self.pipeline.output_stream():
-                self.out.put((self.id, output))
-            self.out.put((self.id, None))
+            async for output in pipeline.output_stream():
+                out_queue.put_nowait((id, output))
+            out_queue.put_nowait((id, None))
 
-        self.add_future(process_output())
-        self.add_future(self.pipeline.segment())
+        self.pipeline = pipeline
+        self.future = asyncio.gather(process_output(), pipeline.segment())
 
-    def add_future(self, coro: Coroutine):
-        self.futures.append(asyncio.run_coroutine_threadsafe(coro, self.loop))
-
-    async def run_until_finished(self):
-        for f in self.futures:
-            if not f.done:
-                await f
+    def send(self, text: str | None):
+        self.pipeline.fill(text)
 
 
 class SegmentationManager:
     def __init__(
         self,
         seg_config: SegSent2StreamConfig | SegSent2GeneratorConfig,
-        on_output: Callable[[str, str], Any],
         segmenters: List[Callable[[str], str]] | None = None,
     ):
         self.seg_config = seg_config
@@ -59,70 +48,64 @@ class SegmentationManager:
         elif isinstance(seg_config, SegSent2GeneratorConfig):
             self.seg_pipeline_class = SegSent2GeneratorPipeline
 
-        if segmenters is None:
-            self.segmenters = [get_sentence_segmenter()]
-        else:
-            self.segmenters = segmenters
-
+        self.segmenters = segmenters if segmenters else [get_sentence_segmenter()]
         self.manager = Manager()
         self.in_queue = self.manager.Queue()
         self.out_queue = self.manager.Queue()
-        self.output_processing_func = on_output
 
-        self.seg_process = Process(target=self.segmentation_task, name="segmenting")
-        self.out_process = Process(target=self.output_processing_task)
+    def segmentation_process(self):
+        tasks: Dict[str, SegmentationTask] = {}
 
-    def segmentation_task(self):
-        seg_statuses: Dict[str, SegmentationStatus] = {}
-        loop = asyncio.new_event_loop()
+        async def main():
+            while True:
+                try:
+                    id, text = self.in_queue.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.001)
+                    continue
+                if id is None:
+                    break
+                if id not in tasks:
+                    tasks[id] = SegmentationTask(
+                        id=id,
+                        pipeline=self.seg_pipeline_class(
+                            config=self.seg_config, segmenters=self.segmenters
+                        ),
+                        out_queue=self.out_queue,
+                    )
+                tasks[id].send(text)
 
-        def run_event_loop(loop):
-            asyncio.set_event_loop(loop)
-            loop.run_forever()
+            for s in tasks.values():
+                await s.future
 
-        thread = threading.Thread(target=run_event_loop, args=(loop,))
-        thread.start()
+        asyncio.run(main())
 
+    def start(self):
+        self.seg_process = Process(target=self.segmentation_process, name="segmenting")
+        self.seg_process.start()
+
+    def add_text(self, id: str | None, text: str | None):
+        self.in_queue.put_nowait((id, text))
+
+    async def get_async_output(self):
         while True:
-            id, text = self.in_queue.get()
+            try:
+                id, output = self.out_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.001)
+                continue
             if id is None:
-                break
-            if id not in seg_statuses:
-                status = SegmentationStatus(
-                    id=id,
-                    pipeline=self.seg_pipeline_class(
-                        config=self.seg_config, segmenters=self.segmenters
-                    ),
-                    out=self.out_queue,
-                    loop=loop,
-                )
-                seg_statuses[id] = status
-                status.run()
-            seg_statuses[id].add_text(text)
+                return
+            yield (id, output)
 
-        async def run_until_all_finished():
-            for s in seg_statuses.values():
-                await s.run_until_finished()
-
-        asyncio.run(run_until_all_finished())
-        loop.call_soon_threadsafe(loop.stop)
-
-    def output_processing_task(self):
+    def get_output(self):
         while True:
             id, output = self.out_queue.get()
             if id is None:
                 break
-            self.output_processing_func(id, output)
-
-    def start(self):
-        self.seg_process.start()
-        self.out_process.start()
-
-    def add_text(self, id: str | None, text: str | None):
-        self.in_queue.put_nowait((id, text))
+            yield (id, output)
 
     def close(self):
         self.in_queue.put((None, None))
         self.seg_process.join()
         self.out_queue.put((None, None))
-        self.out_process.join()
